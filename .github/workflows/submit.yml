@@ -1,0 +1,27 @@
+name: Submit script.module.zeroconf
+
+on:
+  workflow_dispatch:
+
+jobs:
+  kodi-addon-submitter:
+    runs-on: ubuntu-latest
+    name: Kodi addon submitter
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v3
+
+    - name: Submit to official kodi repository
+      id: kodi-addon-submitter
+      uses: xbmc/action-kodi-addon-submitter@master
+      with: # Replace all the below values
+        kodi-repository: repo-scripts
+        kodi-version: matrix
+        addon-id: script.module.zeroconf
+        kodi-matrix: false # Submit a Python 2/3 compatible addon to matrix branch in addition to the target branch
+        sub-directory: true #Addon is stored in its own directory within the git repo
+        #push-only: true # Only push to your repo fork and not create a pull request'
+      env: # Make sure you create the below secrets (GH_TOKEN and EMAIL)
+        GH_USERNAME: ${{ github.actor }}
+        GH_TOKEN: ${{secrets.GH_TOKEN}}
+        EMAIL: ${{secrets.EMAIL}}
