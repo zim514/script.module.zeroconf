@@ -67,10 +67,13 @@ class DNSEntry:
 
     __slots__ = ('key', 'name', 'type', 'class_', 'unique')
 
-    def __init__(self, name: str, type_: _int, class_: _int) -> None:
+    def __init__(self, name: str, type_: int, class_: int) -> None:
         self.name = name
         self.key = name.lower()
         self.type = type_
+        self._set_class(class_)
+
+    def _set_class(self, class_: _int) -> None:
         self.class_ = class_ & _CLASS_MASK
         self.unique = (class_ & _CLASS_UNIQUE) != 0
 
@@ -174,7 +177,7 @@ class DNSRecord(DNSEntry):
     def suppressed_by(self, msg: 'DNSIncoming') -> bool:
         """Returns true if any answer in a message can suffice for the
         information held in this record."""
-        answers = msg.answers
+        answers = msg.answers()
         for record in answers:
             if self._suppressed_by_answer(record):
                 return True
@@ -241,7 +244,6 @@ class DNSAddress(DNSRecord):
         class_: int,
         ttl: int,
         address: bytes,
-        *,
         scope_id: Optional[int] = None,
         created: Optional[float] = None,
     ) -> None:
@@ -371,7 +373,6 @@ class DNSText(DNSRecord):
     def __init__(
         self, name: str, type_: int, class_: int, ttl: int, text: bytes, created: Optional[float] = None
     ) -> None:
-        assert isinstance(text, (bytes, type(None)))
         super().__init__(name, type_, class_, ttl, created)
         self.text = text
         self._hash = hash((self.key, type_, self.class_, text))
@@ -479,17 +480,21 @@ class DNSNsec(DNSRecord):
     def write(self, out: 'DNSOutgoing') -> None:
         """Used in constructing an outgoing packet."""
         bitmap = bytearray(b'\0' * 32)
+        total_octets = 0
         for rdtype in self.rdtypes:
             if rdtype > 255:  # mDNS only supports window 0
-                continue
-            offset = rdtype % 256
-            byte = offset // 8
+                raise ValueError(f"rdtype {rdtype} is too large for NSEC")
+            byte = rdtype // 8
             total_octets = byte + 1
-            bitmap[byte] |= 0x80 >> (offset % 8)
+            bitmap[byte] |= 0x80 >> (rdtype % 8)
+        if total_octets == 0:
+            # NSEC must have at least one rdtype
+            # Writing an empty bitmap is not allowed
+            raise ValueError("NSEC must have at least one rdtype")
         out_bytes = bytes(bitmap[0:total_octets])
         out.write_name(self.next_name)
-        out.write_short(0)
-        out.write_short(len(out_bytes))
+        out._write_byte(0)  # Always window 0
+        out._write_byte(len(out_bytes))
         out.write_string(out_bytes)
 
     def __eq__(self, other: Any) -> bool:
@@ -521,15 +526,15 @@ _DNSRecord = DNSRecord
 class DNSRRSet:
     """A set of dns records with a lookup to get the ttl."""
 
-    __slots__ = ('_record_sets', '_lookup')
+    __slots__ = ('_records', '_lookup')
 
-    def __init__(self, record_sets: List[List[DNSRecord]]) -> None:
+    def __init__(self, records: List[DNSRecord]) -> None:
         """Create an RRset from records sets."""
-        self._record_sets = record_sets
-        self._lookup: Optional[Dict[DNSRecord, float]] = None
+        self._records = records
+        self._lookup: Optional[Dict[DNSRecord, DNSRecord]] = None
 
     @property
-    def lookup(self) -> Dict[DNSRecord, float]:
+    def lookup(self) -> Dict[DNSRecord, DNSRecord]:
         """Return the lookup table."""
         return self._get_lookup()
 
@@ -537,21 +542,18 @@ class DNSRRSet:
         """Return the lookup table as aset."""
         return set(self._get_lookup())
 
-    def _get_lookup(self) -> Dict[DNSRecord, float]:
+    def _get_lookup(self) -> Dict[DNSRecord, DNSRecord]:
         """Return the lookup table, building it if needed."""
         if self._lookup is None:
             # Build the hash table so we can lookup the record ttl
-            self._lookup = {}
-            for record_sets in self._record_sets:
-                for record in record_sets:
-                    self._lookup[record] = record.ttl
+            self._lookup = {record: record for record in self._records}
         return self._lookup
 
     def suppresses(self, record: _DNSRecord) -> bool:
         """Returns true if any answer in the rrset can suffice for the
         information held in this record."""
         lookup = self._get_lookup()
-        other_ttl = lookup.get(record)
-        if other_ttl is None:
+        other = lookup.get(record)
+        if other is None:
             return False
-        return other_ttl > (record.ttl / 2)
+        return other.ttl > (record.ttl / 2)

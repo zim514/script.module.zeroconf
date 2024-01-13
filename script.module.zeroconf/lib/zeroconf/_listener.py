@@ -23,6 +23,7 @@
 import asyncio
 import logging
 import random
+from functools import partial
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union, cast
 
 from ._logger import QuietLogger, log
@@ -40,8 +41,9 @@ _TC_DELAY_RANDOM_INTERVAL = (400, 500)
 _bytes = bytes
 _str = str
 _int = int
+_float = float
 
-logging_DEBUG = logging.DEBUG
+DEBUG_ENABLED = partial(log.isEnabledFor, logging.DEBUG)
 
 
 class AsyncListener:
@@ -55,7 +57,9 @@ class AsyncListener:
 
     __slots__ = (
         'zc',
+        '_registry',
         '_record_manager',
+        "_query_handler",
         'data',
         'last_time',
         'last_message',
@@ -67,7 +71,9 @@ class AsyncListener:
 
     def __init__(self, zc: 'Zeroconf') -> None:
         self.zc = zc
+        self._registry = zc.registry
         self._record_manager = zc.record_manager
+        self._query_handler = zc.query_handler
         self.data: Optional[bytes] = None
         self.last_time: float = 0
         self.last_message: Optional[DNSIncoming] = None
@@ -80,9 +86,8 @@ class AsyncListener:
     def datagram_received(
         self, data: _bytes, addrs: Union[Tuple[str, int], Tuple[str, int, int, int]]
     ) -> None:
-        assert self.transport is not None
         data_len = len(data)
-        debug = log.isEnabledFor(logging_DEBUG)
+        debug = DEBUG_ENABLED()
 
         if data_len > _MAX_MSG_ABSOLUTE:
             # Guard against oversized packets to ensure bad implementations cannot overwhelm
@@ -95,8 +100,17 @@ class AsyncListener:
                     _MAX_MSG_ABSOLUTE,
                 )
             return
-
         now = current_time_millis()
+        self._process_datagram_at_time(debug, data_len, now, data, addrs)
+
+    def _process_datagram_at_time(
+        self,
+        debug: bool,
+        data_len: _int,
+        now: _float,
+        data: _bytes,
+        addrs: Union[Tuple[str, int], Tuple[str, int, int, int]],
+    ) -> None:
         if (
             self.data == data
             and (now - _DUPLICATE_PACKET_SUPPRESSION_INTERVAL) < self.last_time
@@ -134,7 +148,7 @@ class AsyncListener:
         self.data = data
         self.last_time = now
         self.last_message = msg
-        if msg.valid:
+        if msg.valid is True:
             if debug:
                 log.debug(
                     'Received from %r:%r [socket %s]: %r (%d bytes) as [%r]',
@@ -161,15 +175,21 @@ class AsyncListener:
             self._record_manager.async_updates_from_response(msg)
             return
 
+        if not self._registry.has_entries:
+            # If the registry is empty, we have no answers to give.
+            return
+
+        if TYPE_CHECKING:
+            assert self.transport is not None
         self.handle_query_or_defer(msg, addr, port, self.transport, v6_flow_scope)
 
     def handle_query_or_defer(
         self,
         msg: DNSIncoming,
-        addr: str,
-        port: int,
+        addr: _str,
+        port: _int,
         transport: _WrappedTransport,
-        v6_flow_scope: Union[Tuple[()], Tuple[int, int]] = (),
+        v6_flow_scope: Union[Tuple[()], Tuple[int, int]],
     ) -> None:
         """Deal with incoming query packets.  Provides a response if
         possible."""
@@ -202,7 +222,7 @@ class AsyncListener:
         addr: _str,
         port: _int,
         transport: _WrappedTransport,
-        v6_flow_scope: Union[Tuple[()], Tuple[int, int]] = (),
+        v6_flow_scope: Union[Tuple[()], Tuple[int, int]],
     ) -> None:
         """Respond to a query and reassemble any truncated deferred packets."""
         self._cancel_any_timers_for_addr(addr)
@@ -210,7 +230,7 @@ class AsyncListener:
         if msg:
             packets.append(msg)
 
-        self.zc.handle_assembled_query(packets, addr, port, transport, v6_flow_scope)
+        self._query_handler.handle_assembled_query(packets, addr, port, transport, v6_flow_scope)
 
     def error_received(self, exc: Exception) -> None:
         """Likely socket closed or IPv6."""

@@ -1,4 +1,4 @@
-<addon id="script.module.zeroconf" name="python-zeroconf" version="0.112.0" provider-name="python-zeroconf">
+<addon id="script.module.zeroconf" name="python-zeroconf" version="0.131.0" provider-name="python-zeroconf">
 	<requires>
 		<import addon="xbmc.python" version="3.0.0" />
 	</requires>
@@ -6,7 +6,7 @@
 	<extension point="xbmc.addon.metadata">
 		<license>LGPL-2.1-or-later</license>
 	    <summary lang="en_GB">This is a fork of pyzeroconf, Multicast DNS Service Discovery for Python, originally by Paul Scott-Murphy, modified by William McBrine.</summary>
-	    <description lang="en_GB">This is a fork of pyzeroconf, Multicast DNS Service Discovery for Python, originally by Paul Scott-Murphy (https://github.com/paulsm/pyzeroconf), modified by William McBrine (https://github.com/wmcbrine/pyzeroconf).</description>
+	    <description lang="en_GB">This is a fork of pyzeroconf, Multicast DNS Service Discovery for Python, originally by Paul Scott-Murphy (https://github.com/paulsm/pyzeroconf), modified by William McBrine (https://github.com/wmcbrine/pyzeroconf). Packaged for Kodi (https://github.com/zim514/script.module.zeroconf)</description>
 	    <platform>all</platform>
 	    <website>https://github.com/python-zeroconf/python-zeroconf</website>
 	    <source>https://github.com/python-zeroconf/python-zeroconf</source>

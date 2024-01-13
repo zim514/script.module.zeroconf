@@ -20,19 +20,19 @@
     USA
 """
 
-
-from typing import TYPE_CHECKING, List, Optional, Set, cast
+from typing import TYPE_CHECKING, List, Optional, Set, Tuple, Union, cast
 
 from .._cache import DNSCache, _UniqueRecordsType
 from .._dns import DNSAddress, DNSPointer, DNSQuestion, DNSRecord, DNSRRSet
-from .._history import QuestionHistory
 from .._protocol.incoming import DNSIncoming
-from .._services.registry import ServiceRegistry
+from .._services.info import ServiceInfo
+from .._transport import _WrappedTransport
 from .._utils.net import IPVersion
 from ..const import (
     _ADDRESS_RECORD_TYPES,
     _CLASS_IN,
     _DNS_OTHER_TTL,
+    _MDNS_PORT,
     _ONE_SECOND,
     _SERVICE_TYPE_ENUMERATION_NAME,
     _TYPE_A,
@@ -43,11 +43,49 @@ from ..const import (
     _TYPE_SRV,
     _TYPE_TXT,
 )
-from .answers import QuestionAnswers, _AnswerWithAdditionalsType
+from .answers import (
+    QuestionAnswers,
+    _AnswerWithAdditionalsType,
+    construct_outgoing_multicast_answers,
+    construct_outgoing_unicast_answers,
+)
 
 _RESPOND_IMMEDIATE_TYPES = {_TYPE_NSEC, _TYPE_SRV, *_ADDRESS_RECORD_TYPES}
 
+_EMPTY_SERVICES_LIST: List[ServiceInfo] = []
+_EMPTY_TYPES_LIST: List[str] = []
+
+_IPVersion_ALL = IPVersion.All
+
 _int = int
+_str = str
+
+_ANSWER_STRATEGY_SERVICE_TYPE_ENUMERATION = 0
+_ANSWER_STRATEGY_POINTER = 1
+_ANSWER_STRATEGY_ADDRESS = 2
+_ANSWER_STRATEGY_SERVICE = 3
+_ANSWER_STRATEGY_TEXT = 4
+
+if TYPE_CHECKING:
+    from .._core import Zeroconf
+
+
+class _AnswerStrategy:
+
+    __slots__ = ("question", "strategy_type", "types", "services")
+
+    def __init__(
+        self,
+        question: DNSQuestion,
+        strategy_type: _int,
+        types: List[str],
+        services: List[ServiceInfo],
+    ) -> None:
+        """Create an answer strategy."""
+        self.question = question
+        self.strategy_type = strategy_type
+        self.types = types
+        self.services = services
 
 
 class _QueryResponse:
@@ -55,7 +93,7 @@ class _QueryResponse:
 
     __slots__ = (
         "_is_probe",
-        "_msg",
+        "_questions",
         "_now",
         "_cache",
         "_additionals",
@@ -65,15 +103,11 @@ class _QueryResponse:
         "_mcast_aggregate_last_second",
     )
 
-    def __init__(self, cache: DNSCache, msgs: List[DNSIncoming]) -> None:
+    def __init__(self, cache: DNSCache, questions: List[DNSQuestion], is_probe: bool, now: float) -> None:
         """Build a query response."""
-        self._is_probe = False
-        for msg in msgs:
-            if msg.is_probe:
-                self._is_probe = True
-                break
-        self._msg = msgs[0]
-        self._now = self._msg.now
+        self._is_probe = is_probe
+        self._questions = questions
+        self._now = now
         self._cache = cache
         self._additionals: _AnswerWithAdditionalsType = {}
         self._ucast: Set[DNSRecord] = set()
@@ -107,10 +141,15 @@ class _QueryResponse:
 
             if self._has_mcast_record_in_last_second(answer):
                 self._mcast_aggregate_last_second.add(answer)
-            elif len(self._msg.questions) == 1 and self._msg.questions[0].type in _RESPOND_IMMEDIATE_TYPES:
-                self._mcast_now.add(answer)
-            else:
-                self._mcast_aggregate.add(answer)
+                continue
+
+            if len(self._questions) == 1:
+                question = self._questions[0]
+                if question.type in _RESPOND_IMMEDIATE_TYPES:
+                    self._mcast_now.add(answer)
+                    continue
+
+            self._mcast_aggregate.add(answer)
 
     def answers(
         self,
@@ -136,7 +175,7 @@ class _QueryResponse:
         if TYPE_CHECKING:
             record = cast(_UniqueRecordsType, record)
         maybe_entry = self._cache.async_get_unique(record)
-        return bool(maybe_entry and maybe_entry.is_recent(self._now))
+        return bool(maybe_entry is not None and maybe_entry.is_recent(self._now))
 
     def _has_mcast_record_in_last_second(self, record: DNSRecord) -> bool:
         """Check if an answer was seen in the last second.
@@ -146,28 +185,31 @@ class _QueryResponse:
         if TYPE_CHECKING:
             record = cast(_UniqueRecordsType, record)
         maybe_entry = self._cache.async_get_unique(record)
-        return bool(maybe_entry and self._now - maybe_entry.created < _ONE_SECOND)
+        return bool(maybe_entry is not None and self._now - maybe_entry.created < _ONE_SECOND)
 
 
 class QueryHandler:
     """Query the ServiceRegistry."""
 
-    __slots__ = ("registry", "cache", "question_history")
+    __slots__ = ("zc", "registry", "cache", "question_history", "out_queue", "out_delay_queue")
 
-    def __init__(self, registry: ServiceRegistry, cache: DNSCache, question_history: QuestionHistory) -> None:
+    def __init__(self, zc: 'Zeroconf') -> None:
         """Init the query handler."""
-        self.registry = registry
-        self.cache = cache
-        self.question_history = question_history
+        self.zc = zc
+        self.registry = zc.registry
+        self.cache = zc.cache
+        self.question_history = zc.question_history
+        self.out_queue = zc.out_queue
+        self.out_delay_queue = zc.out_delay_queue
 
     def _add_service_type_enumeration_query_answers(
-        self, answer_set: _AnswerWithAdditionalsType, known_answers: DNSRRSet
+        self, types: List[str], answer_set: _AnswerWithAdditionalsType, known_answers: DNSRRSet
     ) -> None:
         """Provide an answer to a service type enumeration query.
 
         https://datatracker.ietf.org/doc/html/rfc6763#section-9
         """
-        for stype in self.registry.async_get_types():
+        for stype in types:
             dns_pointer = DNSPointer(
                 _SERVICE_TYPE_ENUMERATION_NAME, _TYPE_PTR, _CLASS_IN, _DNS_OTHER_TTL, stype, 0.0
             )
@@ -175,10 +217,10 @@ class QueryHandler:
                 answer_set[dns_pointer] = set()
 
     def _add_pointer_answers(
-        self, lower_name: str, answer_set: _AnswerWithAdditionalsType, known_answers: DNSRRSet
+        self, services: List[ServiceInfo], answer_set: _AnswerWithAdditionalsType, known_answers: DNSRRSet
     ) -> None:
         """Answer PTR/ANY question."""
-        for service in self.registry.async_get_infos_type(lower_name):
+        for service in services:
             # Add recommended additional answers according to
             # https://tools.ietf.org/html/rfc6763#section-12.1.
             dns_pointer = service._dns_pointer(None)
@@ -187,21 +229,22 @@ class QueryHandler:
             answer_set[dns_pointer] = {
                 service._dns_service(None),
                 service._dns_text(None),
-            } | service._get_address_and_nsec_records(None)
+                *service._get_address_and_nsec_records(None),
+            }
 
     def _add_address_answers(
         self,
-        lower_name: str,
+        services: List[ServiceInfo],
         answer_set: _AnswerWithAdditionalsType,
         known_answers: DNSRRSet,
         type_: _int,
     ) -> None:
         """Answer A/AAAA/ANY question."""
-        for service in self.registry.async_get_infos_server(lower_name):
+        for service in services:
             answers: List[DNSAddress] = []
             additionals: Set[DNSRecord] = set()
             seen_types: Set[int] = set()
-            for dns_address in service._dns_addresses(None, IPVersion.All):
+            for dns_address in service._dns_addresses(None, _IPVersion_ALL):
                 seen_types.add(dns_address.type)
                 if dns_address.type != type_:
                     additionals.add(dns_address)
@@ -221,65 +264,174 @@ class QueryHandler:
     def _answer_question(
         self,
         question: DNSQuestion,
+        strategy_type: _int,
+        types: List[str],
+        services: List[ServiceInfo],
         known_answers: DNSRRSet,
     ) -> _AnswerWithAdditionalsType:
         """Answer a question."""
         answer_set: _AnswerWithAdditionalsType = {}
-        question_lower_name = question.name.lower()
-        type_ = question.type
 
-        if type_ == _TYPE_PTR and question_lower_name == _SERVICE_TYPE_ENUMERATION_NAME:
-            self._add_service_type_enumeration_query_answers(answer_set, known_answers)
-            return answer_set
-
-        if type_ in (_TYPE_PTR, _TYPE_ANY):
-            self._add_pointer_answers(question_lower_name, answer_set, known_answers)
-
-        if type_ in (_TYPE_A, _TYPE_AAAA, _TYPE_ANY):
-            self._add_address_answers(question_lower_name, answer_set, known_answers, type_)
-
-        if type_ in (_TYPE_SRV, _TYPE_TXT, _TYPE_ANY):
-            service = self.registry.async_get_info_name(question_lower_name)
-            if service is not None:
-                if type_ in (_TYPE_SRV, _TYPE_ANY):
-                    # Add recommended additional answers according to
-                    # https://tools.ietf.org/html/rfc6763#section-12.2.
-                    dns_service = service._dns_service(None)
-                    if not known_answers.suppresses(dns_service):
-                        answer_set[dns_service] = service._get_address_and_nsec_records(None)
-                if type_ in (_TYPE_TXT, _TYPE_ANY):
-                    dns_text = service._dns_text(None)
-                    if not known_answers.suppresses(dns_text):
-                        answer_set[dns_text] = set()
+        if strategy_type == _ANSWER_STRATEGY_SERVICE_TYPE_ENUMERATION:
+            self._add_service_type_enumeration_query_answers(types, answer_set, known_answers)
+        elif strategy_type == _ANSWER_STRATEGY_POINTER:
+            self._add_pointer_answers(services, answer_set, known_answers)
+        elif strategy_type == _ANSWER_STRATEGY_ADDRESS:
+            self._add_address_answers(services, answer_set, known_answers, question.type)
+        elif strategy_type == _ANSWER_STRATEGY_SERVICE:
+            # Add recommended additional answers according to
+            # https://tools.ietf.org/html/rfc6763#section-12.2.
+            service = services[0]
+            dns_service = service._dns_service(None)
+            if not known_answers.suppresses(dns_service):
+                answer_set[dns_service] = service._get_address_and_nsec_records(None)
+        elif strategy_type == _ANSWER_STRATEGY_TEXT:  # pragma: no branch
+            service = services[0]
+            dns_text = service._dns_text(None)
+            if not known_answers.suppresses(dns_text):
+                answer_set[dns_text] = set()
 
         return answer_set
 
     def async_response(  # pylint: disable=unused-argument
         self, msgs: List[DNSIncoming], ucast_source: bool
-    ) -> QuestionAnswers:
+    ) -> Optional[QuestionAnswers]:
         """Deal with incoming query packets. Provides a response if possible.
 
         This function must be run in the event loop as it is not
         threadsafe.
         """
-        known_answers = DNSRRSet([msg.answers for msg in msgs if not msg.is_probe])
-        query_res = _QueryResponse(self.cache, msgs)
-        known_answers_set: Optional[Set[DNSRecord]] = None
-
+        strategies: List[_AnswerStrategy] = []
         for msg in msgs:
-            for question in msg.questions:
-                if not question.unique:  # unique and unicast are the same flag
-                    if not known_answers_set:  # pragma: no branch
-                        known_answers_set = known_answers.lookup_set()
-                    self.question_history.add_question_at_time(question, msg.now, known_answers_set)
-                answer_set = self._answer_question(question, known_answers)
-                if not ucast_source and question.unique:  # unique and unicast are the same flag
-                    query_res.add_qu_question_response(answer_set)
-                    continue
-                if ucast_source:
-                    query_res.add_ucast_question_response(answer_set)
-                # We always multicast as well even if its a unicast
-                # source as long as we haven't done it recently (75% of ttl)
-                query_res.add_mcast_question_response(answer_set)
+            for question in msg._questions:
+                strategies.extend(self._get_answer_strategies(question))
+
+        if not strategies:
+            # We have no way to answer the question because we have
+            # nothing in the ServiceRegistry that matches or we do not
+            # understand the question.
+            return None
+
+        is_probe = False
+        msg = msgs[0]
+        questions = msg._questions
+        # Only decode known answers if we are not a probe and we have
+        # at least one answer strategy
+        answers: List[DNSRecord] = []
+        for msg in msgs:
+            if msg.is_probe():
+                is_probe = True
+            else:
+                answers.extend(msg.answers())
+
+        query_res = _QueryResponse(self.cache, questions, is_probe, msg.now)
+        known_answers = DNSRRSet(answers)
+        known_answers_set: Optional[Set[DNSRecord]] = None
+        now = msg.now
+        for strategy in strategies:
+            question = strategy.question
+            is_unicast = question.unique  # unique and unicast are the same flag
+            if not is_unicast:
+                if known_answers_set is None:  # pragma: no branch
+                    known_answers_set = known_answers.lookup_set()
+                self.question_history.add_question_at_time(question, now, known_answers_set)
+            answer_set = self._answer_question(
+                question, strategy.strategy_type, strategy.types, strategy.services, known_answers
+            )
+            if not ucast_source and is_unicast:
+                query_res.add_qu_question_response(answer_set)
+                continue
+            if ucast_source:
+                query_res.add_ucast_question_response(answer_set)
+            # We always multicast as well even if its a unicast
+            # source as long as we haven't done it recently (75% of ttl)
+            query_res.add_mcast_question_response(answer_set)
 
         return query_res.answers()
+
+    def _get_answer_strategies(
+        self,
+        question: DNSQuestion,
+    ) -> List[_AnswerStrategy]:
+        """Collect strategies to answer a question."""
+        name = question.name
+        question_lower_name = name.lower()
+        type_ = question.type
+        strategies: List[_AnswerStrategy] = []
+
+        if type_ == _TYPE_PTR and question_lower_name == _SERVICE_TYPE_ENUMERATION_NAME:
+            types = self.registry.async_get_types()
+            if types:
+                strategies.append(
+                    _AnswerStrategy(
+                        question, _ANSWER_STRATEGY_SERVICE_TYPE_ENUMERATION, types, _EMPTY_SERVICES_LIST
+                    )
+                )
+            return strategies
+
+        if type_ in (_TYPE_PTR, _TYPE_ANY):
+            services = self.registry.async_get_infos_type(question_lower_name)
+            if services:
+                strategies.append(
+                    _AnswerStrategy(question, _ANSWER_STRATEGY_POINTER, _EMPTY_TYPES_LIST, services)
+                )
+
+        if type_ in (_TYPE_A, _TYPE_AAAA, _TYPE_ANY):
+            services = self.registry.async_get_infos_server(question_lower_name)
+            if services:
+                strategies.append(
+                    _AnswerStrategy(question, _ANSWER_STRATEGY_ADDRESS, _EMPTY_TYPES_LIST, services)
+                )
+
+        if type_ in (_TYPE_SRV, _TYPE_TXT, _TYPE_ANY):
+            service = self.registry.async_get_info_name(question_lower_name)
+            if service is not None:
+                if type_ in (_TYPE_SRV, _TYPE_ANY):
+                    strategies.append(
+                        _AnswerStrategy(question, _ANSWER_STRATEGY_SERVICE, _EMPTY_TYPES_LIST, [service])
+                    )
+                if type_ in (_TYPE_TXT, _TYPE_ANY):
+                    strategies.append(
+                        _AnswerStrategy(question, _ANSWER_STRATEGY_TEXT, _EMPTY_TYPES_LIST, [service])
+                    )
+
+        return strategies
+
+    def handle_assembled_query(
+        self,
+        packets: List[DNSIncoming],
+        addr: _str,
+        port: _int,
+        transport: _WrappedTransport,
+        v6_flow_scope: Union[Tuple[()], Tuple[int, int]],
+    ) -> None:
+        """Respond to a (re)assembled query.
+
+        If the protocol recieved packets with the TC bit set, it will
+        wait a bit for the rest of the packets and only call
+        handle_assembled_query once it has a complete set of packets
+        or the timer expires. If the TC bit is not set, a single
+        packet will be in packets.
+        """
+        first_packet = packets[0]
+        ucast_source = port != _MDNS_PORT
+        question_answers = self.async_response(packets, ucast_source)
+        if question_answers is None:
+            return
+        if question_answers.ucast:
+            questions = first_packet._questions
+            id_ = first_packet.id
+            out = construct_outgoing_unicast_answers(question_answers.ucast, ucast_source, questions, id_)
+            # When sending unicast, only send back the reply
+            # via the same socket that it was recieved from
+            # as we know its reachable from that socket
+            self.zc.async_send(out, addr, port, v6_flow_scope, transport)
+        if question_answers.mcast_now:
+            self.zc.async_send(construct_outgoing_multicast_answers(question_answers.mcast_now))
+        if question_answers.mcast_aggregate:
+            self.out_queue.async_add(first_packet.now, question_answers.mcast_aggregate)
+        if question_answers.mcast_aggregate_last_second:
+            # https://datatracker.ietf.org/doc/html/rfc6762#section-14
+            # If we broadcast it in the last second, we have to delay
+            # at least a second before we send it again
+            self.out_delay_queue.async_add(first_packet.now, question_answers.mcast_aggregate_last_second)

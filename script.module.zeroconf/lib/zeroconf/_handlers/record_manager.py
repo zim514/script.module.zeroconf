@@ -84,10 +84,9 @@ class RecordManager:
         other_adds: List[DNSRecord] = []
         removes: Set[DNSRecord] = set()
         now = msg.now
-        now_float = now
         unique_types: Set[Tuple[str, int, int]] = set()
         cache = self.cache
-        answers = msg.answers
+        answers = msg.answers()
 
         for record in answers:
             # Protect zeroconf from records that can cause denial of service.
@@ -113,7 +112,7 @@ class RecordManager:
                 record = cast(_UniqueRecordsType, record)
 
             maybe_entry = cache.async_get_unique(record)
-            if not record.is_expired(now_float):
+            if not record.is_expired(now):
                 if maybe_entry is not None:
                     maybe_entry.reset_ttl(record)
                 else:
@@ -182,7 +181,6 @@ class RecordManager:
             return
 
         questions = [question] if isinstance(question, DNSQuestion) else question
-        assert self.zc.loop is not None
         self._async_update_matching_records(listener, questions)
 
     def _async_update_matching_records(
